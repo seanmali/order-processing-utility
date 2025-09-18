@@ -1,0 +1,7 @@
+PyInstaller
+PyPDF2
+pdfminer.six
+reportlab
+pandas
+openpyxl
+tkinterdnd2
