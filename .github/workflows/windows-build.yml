@@ -24,7 +24,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Build EXE with PyInstaller
-        run: pyinstaller --noconsole --onefile --name "OrderProcessingUtility" newsort.py
+        run: pyinstaller --noconsole --onefile --icon app.ico --name "OrderProcessingUtility" newsort.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
