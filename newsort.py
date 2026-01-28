@@ -48,9 +48,14 @@ def update_page_count_display():
 # ------------------------
 # UPC/SKU logic
 # ------------------------
-SKU_REGEX = re.compile(r'(OT|OTA|OTB|OTC|OTS|TSD)\d+[A-Za-z0-9-]*')
+# NOTE:
+#  - SKUs can contain decimals (e.g., OTS25113-COFFEE-7.5)
+#  - Some PDF text extractors occasionally glue the next line label ("Status")
+#    to the SKU token (e.g., "OT24700-BROWNStatus"). We defensively strip
+#    any trailing "STATUS" token when extracting.
+SKU_REGEX = re.compile(r'\b(OT|OTA|OTB|OTC|OTS|TSD)\d+[A-Za-z0-9]*(?:-[A-Za-z0-9.]+)*\b')
 
-SKU_SORT_PARTS = re.compile(r'^(OTA|OTB|OTC|OTS|OT|TSD|AAA)(\d+)([A-Za-z0-9-]*)$')
+SKU_SORT_PARTS = re.compile(r'^(OTA|OTB|OTC|OTS|OT|TSD|AAA)(\d+)([A-Za-z0-9.-]*)$')
 
 PREFIX_ORDER = {
     "AAA": 0,  # placeholder / missing
@@ -131,6 +136,12 @@ def _normalize_text_for_sku(text: str) -> str:
     return (
         (text or "")
         .replace("\xa0", " ")
+        # Some PDFs embed odd "replacement" glyphs between wrapped fields.
+        # On QVC slips we've observed a stray box char between GREY and M36.
+        # Normalize it to a hyphen so our SKU regexes can see a continuous token.
+        .replace("￾", "-")
+        .replace("\ufffd", "-")
+        .replace("\ufeff", "")
         .replace("\u00ad", "-")
         .replace("\u2010", "-")
         .replace("\u2011", "-")
@@ -139,14 +150,47 @@ def _normalize_text_for_sku(text: str) -> str:
         .replace("\u2014", "-")
     )
 
-def find_sku_in_text(text):
-    text = _normalize_text_for_sku(text)
+def _prepare_text_for_sku_scans(text: str) -> str:
+    """Normalize page text and repair common extraction artifacts before SKU scanning."""
+    t = _normalize_text_for_sku(text)
 
-    split_sku_regex = re.compile(r'(OT|OTA|OTB|OTC|OTS|TSD)(\d+)\W+([A-Za-z0-9-]+)')
+    # Strip glued "Status" label from the end of SKU tokens (case-insensitive)
+    t = re.sub(
+        r'(?i)(\b(?:OT|OTA|OTB|OTC|OTS|TSD)\d+[A-Za-z0-9.-]*?)STATUS\b',
+        r'\1',
+        t,
+    )
+
+    # Join SKUs split across *lines* where the first line ends with a hyphen.
+    # Examples: OT21710- + TURQUOISE  -> OT21710-TURQUOISE;  OTB2400-GREY- + M36 -> OTB2400-GREY-M36
+    def _join_split_sku(m):
+        left = m.group(1)  # includes trailing '-'
+        right = (m.group(2) or "").strip()
+        return left + right
+
+    t = re.sub(
+        r'(\b(?:OT|OTA|OTB|OTC|OTS|TSD)\d+(?:-[A-Za-z0-9.]+)*-)\s*(?:\r?\n|\r)+\s*([A-Za-z0-9.]+)\b',
+        _join_split_sku,
+        t,
+        flags=re.MULTILINE,
+    )
+
+    return t
+
+
+def find_sku_in_text(text):
+    text = _prepare_text_for_sku_scans(text)
+
+    # Allow decimals in the final segment (e.g., "-7.5").
+    split_sku_regex = re.compile(r'(OT|OTA|OTB|OTC|OTS|TSD)(\d+)\W+([A-Za-z0-9.-]+)')
     m = split_sku_regex.search(text)
     if m:
         prefix, number, suffix = m.groups()
-        return f"{prefix}{number}-{suffix}"
+        candidate = f"{prefix}{number}-{suffix}"
+        # Guard against partial matches that end with a hyphen when the SKU is
+        # actually wrapped to the next line/field (e.g., "OTB2400-GREY-" + "M36").
+        if not candidate.endswith("-"):
+            return candidate
 
     m2 = SKU_REGEX.search(text)
     if m2:
@@ -379,12 +423,29 @@ RenderPDFTrue = 1
 
 
 def canonical_sku(s: str) -> str:
-    """Canonicalize SKU strings so case differences don't split Pick List rows."""
+    """Canonicalize SKU strings so extraction quirks don't split Pick List rows.
+
+    Handles:
+      - Case-only differences (e.g., "TSD21308-Olive" vs "TSD21308-OLIVE")
+      - pdf text extraction occasionally glues the next-line label onto the token
+        (e.g., "OT24700-BROWNStatus" -> "OT24700-BROWN")
+      - Normalizes various hyphen characters to '-'
+    """
     if s is None:
         return ""
-    s = str(s).strip()
+    s = _normalize_text_for_sku(str(s)).strip()
     if not s:
         return ""
+
+    # Collapse whitespace around hyphens so split-line SKUs don't become distinct keys.
+    # e.g. "OT21710- TURQUOISE" -> "OT21710-TURQUOISE"
+    s = re.sub(r"\s*-\s*", "-", s)
+
+    # Strip ONLY a trailing STATUS label if it was glued onto the SKU token.
+    # We do this at canonicalization time to ensure *all* extraction paths
+    # (regex matches, split matches, mapped SKUs, etc.) converge.
+    s = re.sub(r'(?i)STATUS\s*$', '', s).strip()
+
     return s.upper()
 
 def compress_page_ranges(nums):
@@ -585,7 +646,7 @@ def extract_macys_qty_by_sku(text: str, upc_to_sku: dict) -> dict:
     if not text:
         return totals
 
-    norm = _normalize_text_for_sku(text)
+    norm = _prepare_text_for_sku_scans(text)
 
     for m in MACYS_ROW_RE.finditer(norm):
         upc_raw = m.group(1)
@@ -631,27 +692,31 @@ def extract_direct_skus_from_page_text(text: str) -> set:
     """
     Extract ONLY SKUs that are explicitly present in the page text.
     This intentionally does NOT use UPC→SKU mapping.
+
+    IMPORTANT: We avoid "split token" regexes that can produce partial SKUs like
+    'OTB2400-GREY-' when the size (e.g., M36) is wrapped to the next line.
     """
     if not text:
         return set()
 
-    norm = _normalize_text_for_sku(text)
-    skus = set()
+    norm = _prepare_text_for_sku_scans(text)
+    skus: set[str] = set()
 
     # Prefer "SKU:" labeled occurrences
     for m in re.finditer(r'(?i)SKU:\s*', norm):
         start = m.end()
-        slice_ = norm[start:start + 120]
+        slice_ = norm[start:start + 140]
         sku = find_sku_in_text(slice_)
         if sku:
-            skus.add(sku)
+            skus.add(canonical_sku(sku))
 
-    # Also capture split SKU patterns that pdfminer sometimes breaks apart
-    for m in re.finditer(r'(OT|OTA|OTB|OTC|OTS|TSD)(\d+)\W+([A-Za-z0-9-]+)', norm):
-        prefix, number, suffix = m.groups()
-        skus.add(f"{prefix}{number}-{suffix}")
+    # Also capture any SKU-like tokens present anywhere on the page
+    for m in SKU_REGEX.finditer(norm):
+        sku = m.group(0)
+        if sku and sku != 'AAA0000':
+            skus.add(canonical_sku(sku))
 
-    skus.discard("AAA0000")
+    skus.discard('AAA0000')
     return skus
 
 def extract_mapped_skus_from_page_text(text: str, upc_to_sku: dict) -> set:
@@ -661,7 +726,7 @@ def extract_mapped_skus_from_page_text(text: str, upc_to_sku: dict) -> set:
     if not text or not upc_to_sku:
         return set()
 
-    norm = _normalize_text_for_sku(text)
+    norm = _prepare_text_for_sku_scans(text)
 
     mapped = set()
 
@@ -704,7 +769,7 @@ def extract_picklist_sku_occurrences_with_upc_override(text: str, upc_to_sku: di
     if not text:
         return []
 
-    norm = _normalize_text_for_sku(text)
+    norm = _prepare_text_for_sku_scans(text)
     results: list[str] = []
 
     # 1) Prefer labeled 'SKU:' occurrences (most reliable positions)
@@ -719,13 +784,9 @@ def extract_picklist_sku_occurrences_with_upc_override(text: str, upc_to_sku: di
 
     # 2) Capture other SKU-like tokens (covers pdfminer line-break weirdness)
     #    We keep positions so we can look for nearby UPCs.
-    pattern = re.compile(r'\b(OT|OTA|OTB|OTC|OTS|TSD)\d{3,}-[A-Z0-9]+(?:-[A-Z0-9]+)*\b')
-    for m in pattern.finditer(norm):
+    for m in SKU_REGEX.finditer(norm):
         sku = m.group(0)
         if sku == "AAA0000":
-            continue
-        # Avoid duplicating SKUs already captured via 'SKU:' by checking nearby prior picks
-        if results and sku == results[-1]:
             continue
         override = _mapped_sku_near_index(norm, m.start(), upc_to_sku)
         results.append(canonical_sku(override or sku))
@@ -739,7 +800,7 @@ def remap_macys_qty_by_upc_near_sku(text: str, sku_qty: dict, upc_to_sku: dict) 
     if not text or not sku_qty or not upc_to_sku:
         return sku_qty or {}
 
-    norm = _normalize_text_for_sku(text)
+    norm = _prepare_text_for_sku_scans(text)
     out: dict[str, int] = {}
     for sku, qty in sku_qty.items():
         try:
